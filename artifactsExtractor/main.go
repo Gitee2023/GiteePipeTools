@@ -22,6 +22,7 @@ const envPrefix = "ARTIFACT_"
 
 func main() {
 	debug := flag.Bool("debug", false, "Debug mode")
+	envPrefix := flag.String("envprefix", "ARTIFACT_", "Environment prefix")
 	targetDir := flag.String("targetdir", "./", "Destination directory to extracted files")
 	flag.Parse()
 
@@ -31,7 +32,7 @@ func main() {
 
 	var artifactURLs []string
 	for _, env := range os.Environ() {
-		if strings.Contains(env, envPrefix) {
+		if strings.Contains(env, *envPrefix) {
 			envSpl := strings.Split(env, "=")
 			if len(envSpl) != 2 {
 				logrus.Debugf("Environmet has no value: %s", envSpl[0])
