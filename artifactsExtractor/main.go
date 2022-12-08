@@ -18,8 +18,6 @@ import (
 	"github.com/sirupsen/logrus"
 )
 
-const envPrefix = "ARTIFACT_"
-
 func main() {
 	debug := flag.Bool("debug", false, "Debug mode")
 	envPrefix := flag.String("envprefix", "ARTIFACT_", "Environment prefix")
