@@ -1,29 +1,40 @@
-// snippet-sourcetype:[full-example]
 package main
 
 import (
+	"context"
 	"flag"
 	"os"
 	"path/filepath"
-	"strings"
 
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/credentials"
-	"github.com/aws/aws-sdk-go/aws/session"
-	"github.com/aws/aws-sdk-go/service/s3/s3manager"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/credentials"
+	"github.com/aws/aws-sdk-go-v2/feature/s3/manager"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/mushroomsir/mimetypes"
 	"github.com/sirupsen/logrus"
 )
 
-var dirPrefixToStrinp string
+type fileWalk chan string
+
+func (f fileWalk) Walk(path string, info os.FileInfo, err error) error {
+	if err != nil {
+		return err
+	}
+	if !info.IsDir() {
+		f <- path
+	}
+	return nil
+}
 
 func main() {
 	debug := flag.Bool("debug", false, "Debug mode")
 	endpointURL := flag.String("endpointurl", "https://storage.yandexcloud.net", "Endpoint URL")
+	signingRegion := flag.String("region", "ru-central1", "Region name")
 	bucketName := flag.String("bucket", "", "Bucket name")
-	uploadDir := flag.String("uploaddir", "", "Dir path to upload")
 	akid := flag.String("akid", "", "aws_access_key_id")
 	asak := flag.String("asak", "", "aws_secret_access_key")
-	region := flag.String("region", "ru-central1", "Region name")
+	uploadDir := flag.String("uploaddir", "", "Dir path to upload")
 
 	flag.Parse()
 
@@ -39,86 +50,65 @@ func main() {
 		logrus.SetLevel(logrus.DebugLevel)
 	}
 
-	dirPrefixToStrinp = *uploadDir
-	di := NewDirectoryIterator(*bucketName, *uploadDir)
-
-	sess, err := session.NewSession(&aws.Config{
-		Endpoint:    endpointURL,
-		Credentials: credentials.NewStaticCredentials(*akid, *asak, ""),
-		Region:      aws.String(*region),
-	})
-
-	if err != nil {
-		logrus.Fatalf("Failed to create a session: %v", err)
-	}
-
-	uploader := s3manager.NewUploader(sess)
-
-	if err := uploader.UploadWithIterator(aws.BackgroundContext(), di); err != nil {
-		logrus.Fatalf("Failed to upload: %v", err)
-	}
-	logrus.Infof("Successfully uploaded %q to %q", *uploadDir, *bucketName)
-}
-
-// DirectoryIterator represents an iterator of a specified directory
-type DirectoryIterator struct {
-	filePaths []string
-	bucket    string
-	next      struct {
-		path string
-		f    *os.File
-	}
-	err error
-}
-
-// NewDirectoryIterator builds a new DirectoryIterator
-func NewDirectoryIterator(bucket, dir string) s3manager.BatchUploadIterator {
-	var paths []string
-	filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
-		if !info.IsDir() {
-			paths = append(paths, path)
+	walker := make(fileWalk)
+	go func() {
+		// Gather the files to upload by walking the path recursively
+		if err := filepath.Walk(*uploadDir, walker.Walk); err != nil {
+			logrus.Fatalln("Walk failed:", err)
 		}
-		return nil
+		close(walker)
+	}()
+
+	// Create custom endpoint resolver for returning correct URL for S3 storage in ru-central1 region
+	customResolver := aws.EndpointResolverWithOptionsFunc(func(service, region string, options ...interface{}) (aws.Endpoint, error) {
+		return aws.Endpoint{
+			PartitionID:   "yc",
+			URL:           *endpointURL,
+			SigningRegion: *signingRegion,
+		}, nil
 	})
 
-	return &DirectoryIterator{
-		filePaths: paths,
-		bucket:    bucket,
-	}
-}
-
-// Next returns whether next file exists or not
-func (di *DirectoryIterator) Next() bool {
-	if len(di.filePaths) == 0 {
-		di.next.f = nil
-		return false
+	ctx := context.Background()
+	cfg, err := config.LoadDefaultConfig(ctx,
+		config.WithEndpointResolverWithOptions(customResolver),
+		config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(*akid, *asak, "")),
+	)
+	if err != nil {
+		logrus.Fatalf("Failed to create a config: %v", err)
 	}
 
-	f, err := os.Open(di.filePaths[0])
-	di.err = err
-	di.next.f = f
-	di.next.path = strings.TrimPrefix(di.filePaths[0], dirPrefixToStrinp)
-	di.filePaths = di.filePaths[1:]
+	// For each file found walking, upload it to Amazon S3
+	uploader := manager.NewUploader(s3.NewFromConfig(cfg))
+	for path := range walker {
+		rel, err := filepath.Rel(*uploadDir, path)
+		if err != nil {
+			logrus.Fatalln("Unable to get relative path:", path, err)
+		}
 
-	return true && di.Err() == nil
-}
+		file, err := os.Open(path)
+		if err != nil {
+			logrus.Println("Failed opening file", path, err)
+			continue
+		}
+		defer file.Close()
 
-// Err returns error of DirectoryIterator
-func (di *DirectoryIterator) Err() error {
-	return di.err
-}
-
-// UploadObject uploads a file
-func (di *DirectoryIterator) UploadObject() s3manager.BatchUploadObject {
-	f := di.next.f
-	return s3manager.BatchUploadObject{
-		Object: &s3manager.UploadInput{
-			Bucket: &di.bucket,
-			Key:    &di.next.path,
-			Body:   f,
-		},
-		After: func() error {
-			return f.Close()
-		},
+		mtype := mimetypes.Lookup(path)
+		result, err := uploader.Upload(context.TODO(), &s3.PutObjectInput{
+			Bucket:      bucketName,
+			Key:         aws.String(filepath.Join("./", rel)),
+			Body:        file,
+			ContentType: stringPtr(mtype),
+		})
+		if err != nil {
+			logrus.Errorf("Failed to upload %q: %v", path, err)
+			continue
+		}
+		logrus.Debugf("Uploaded: %q, %s, %s", path, result.Location, mtype)
 	}
+
+	logrus.Infof("Successfully uploaded directory: %q to bucket: %q", *uploadDir, *bucketName)
+}
+
+func stringPtr(s string) *string {
+	return &s
 }
